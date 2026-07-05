@@ -1,0 +1,46 @@
+set_location:
+  name: Set GameDay location (override)
+  description: Manually set the host site when the parser misses an announcement.
+  fields:
+    school:
+      name: School
+      description: Host school as it appears on the ESPN schedule (e.g. "Washington").
+      required: true
+      selector:
+        text:
+    source_url:
+      name: Source URL
+      description: Optional link to the announcement.
+      selector:
+        text:
+
+set_picker:
+  name: Set guest picker (override)
+  fields:
+    name:
+      name: Guest picker name
+      required: true
+      selector:
+        text:
+    source_url:
+      name: Source URL
+      selector:
+        text:
+
+set_picks:
+  name: Set final picks (override)
+  description: Map of person -> picked team, e.g. {"Kirk Herbstreit":"Ohio State"}.
+  fields:
+    picks:
+      name: Picks
+      required: true
+      selector:
+        object:
+    source_url:
+      name: Source URL
+      selector:
+        text:
+
+clear_overrides:
+  name: Clear all overrides
+  description: Remove manual overrides and return to parsed data.
