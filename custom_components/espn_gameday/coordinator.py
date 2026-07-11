@@ -116,7 +116,10 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else PHASE_OFFSEASON
         )
 
-        next_show, show_end = _next_show_window(now, season_start, season_end)
+        premiere = _premiere_from_calendar(league)
+        next_show, show_end = _next_show_window(
+            now, season_start, season_end, premiere
+        )
 
         # --- News parsing (skip network call deep offseason to be polite) ---
         articles: list[dict] = []
@@ -250,12 +253,51 @@ def _parse_iso(value: str | None) -> datetime | None:
     return parsed
 
 
+def _premiere_from_calendar(league: dict) -> datetime | None:
+    """Premiere Saturday derived from the regular-season Week 1 calendar entry.
+
+    ESPN's calendar usually folds Week 0 into its 'Week 1' entry, so the
+    entry's date range spans two Saturdays. GameDay premieres on the LAST
+    Saturday of that range (the true Week 1 Saturday), so anchor there:
+    last Saturday on/before the entry's endDate, at 9:00 AM ET.
+    """
+    for block in league.get("calendar") or []:
+        if not isinstance(block, dict):
+            return None  # unexpected calendar shape; fall back to old logic
+        label = (block.get("label") or "").lower()
+        if "regular" not in label and str(block.get("value")) != "2":
+            continue
+        entries = block.get("entries") or []
+        if not entries:
+            return None
+        end = _parse_iso(entries[0].get("endDate"))
+        if not end:
+            return None
+        local = end.astimezone(ET)
+        days_back = (local.weekday() - 5) % 7  # Saturday == weekday 5
+        saturday = (local - timedelta(days=days_back)).replace(
+            hour=SHOW_START_HOUR_ET, minute=0, second=0, microsecond=0
+        )
+        return saturday.astimezone(dt_util.UTC)
+    return None
+
+
 def _next_show_window(
-    now: datetime, season_start: datetime | None, season_end: datetime | None
+    now: datetime,
+    season_start: datetime | None,
+    season_end: datetime | None,
+    premiere: datetime | None = None,
 ) -> tuple[datetime | None, datetime | None]:
-    """Next Saturday 9:00-12:00 ET that falls inside the season."""
+    """Next Saturday 9:00-12:00 ET that falls inside the season.
+
+    Before the premiere, the countdown targets the premiere itself rather
+    than the first Saturday of ESPN's season range (which includes Week 0).
+    """
     if not season_start or not season_end:
         return None, None
+    if premiere and now < premiere:
+        end_et = premiere.astimezone(ET).replace(hour=SHOW_END_HOUR_ET)
+        return premiere, end_et.astimezone(dt_util.UTC)
     cursor = max(now, season_start).astimezone(ET)
     for _ in range(0, 8):
         days_ahead = (5 - cursor.weekday()) % 7
