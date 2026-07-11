@@ -1,7 +1,13 @@
-"""DataUpdateCoordinator for ESPN College GameDay."""
+"""DataUpdateCoordinator for ESPN College GameDay (v0.2 schedule model).
+
+Core idea: announced sites live in a per-week ``schedule`` map. The
+"current location" is a DERIVED VIEW — the schedule entry for the week
+containing the next show — so promotion on week rollover is automatic.
+"""
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -41,9 +47,11 @@ _LOGGER = logging.getLogger(__name__)
 ET = ZoneInfo(SHOW_TZ)
 CT = ZoneInfo(LOCAL_TZ)
 
+LOOKAHEAD_WEEKS = 2  # fetch current week + this many ahead
+
 
 class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Fetches ESPN data, runs parsers, manages phase + persistence."""
+    """Fetches ESPN data, maintains the per-week schedule, derives state."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
@@ -55,13 +63,16 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
         self.client = EspnClient(async_get_clientsession(hass))
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        # Persisted state: detected announcements + manual overrides.
+        # schedule: {"<week>": {school, game_id, source_url, ...}}
+        # overrides: {"location:<week>" | "picker" | "picks": {value, set_at}}
         self.state: dict[str, Any] = {
-            "location": None,
+            "schedule": {},
             "picker": None,
             "picks": None,
             "overrides": {},
+            "last_primary": None,
         }
+        self.primary_week: int | None = None
         raw = entry.data.get(CONF_FLAIR_TEAMS, DEFAULT_FLAIR_TEAMS)
         self.flair_teams = [t.strip().lower() for t in raw.split(",") if t.strip()]
 
@@ -71,7 +82,15 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_load_store(self) -> None:
         stored = await self._store.async_load()
         if stored:
-            self.state.update(stored)
+            # v0.1 -> v0.2 migration: drop legacy single-slot keys.
+            stored.pop("location", None)
+            legacy = stored.get("overrides", {}).pop("location", None)
+            if legacy:
+                _LOGGER.info(
+                    "Legacy single-slot location override dropped during "
+                    "v0.2 migration; re-run espn_gameday.set_location with a week."
+                )
+            self.state.update({k: v for k, v in stored.items() if k in self.state})
 
     async def _async_save(self) -> None:
         await self._store.async_save(self.state)
@@ -79,6 +98,17 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
     # Override services
     # ------------------------------------------------------------------
+    async def async_set_location(
+        self, school: str, week: int | None = None, source_url: str = ""
+    ) -> None:
+        target = week or self.primary_week or 1
+        self.state["overrides"][f"location:{target}"] = {
+            "value": {"school": school, "source_url": source_url, "week": target},
+            "set_at": dt_util.utcnow().isoformat(),
+        }
+        await self._async_save()
+        await self.async_request_refresh()
+
     async def async_set_override(self, key: str, value: Any) -> None:
         self.state["overrides"][key] = {
             "value": value,
@@ -106,8 +136,7 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         season_start = _parse_iso(season.get("startDate"))
         season_end = _parse_iso(season.get("endDate"))
         season_year = season.get("year")
-        week_number = (scoreboard.get("week") or {}).get("number")
-        events = scoreboard.get("events") or []
+        base_week = (scoreboard.get("week") or {}).get("number")
 
         now = dt_util.utcnow()
         phase = (
@@ -120,39 +149,53 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         next_show, show_end = _next_show_window(
             now, season_start, season_end, premiere
         )
+        windows = _week_windows(league)
+        self.primary_week = _week_of(next_show, windows) or base_week
 
-        # --- News parsing (skip network call deep offseason to be polite) ---
+        # --- Multi-week event fetch: primary week + lookahead ---
+        events_by_week: dict[int, list[dict]] = {}
+        if base_week is not None:
+            events_by_week[base_week] = scoreboard.get("events") or []
+        if self.primary_week is not None:
+            for wk in range(self.primary_week, self.primary_week + LOOKAHEAD_WEEKS + 1):
+                if wk in events_by_week or (windows and wk not in windows):
+                    continue
+                try:
+                    board = await self.client.get_scoreboard(week=wk)
+                    events_by_week[wk] = board.get("events") or []
+                except EspnApiError as err:
+                    _LOGGER.debug("Week %s scoreboard fetch failed: %s", wk, err)
+
+        # --- News parsing: always on; early announcements age out fast ---
         articles: list[dict] = []
-        if phase == PHASE_IN_SEASON or (
-            season_start and now >= season_start - timedelta(days=21)
-        ):
-            try:
-                articles = await self.client.get_news()
-            except EspnApiError as err:
-                _LOGGER.warning("News fetch failed (non-fatal): %s", err)
+        try:
+            articles = await self.client.get_news()
+        except EspnApiError as err:
+            _LOGGER.warning("News fetch failed (non-fatal): %s", err)
 
-        games = parser.build_game_aliases(events)
-        self._reconcile("location", parser.find_location(articles, games), EVENT_LOCATION)
+        games_by_week = {
+            wk: parser.build_game_aliases(evs) for wk, evs in events_by_week.items()
+        }
+        for week, candidate in parser.find_locations(articles, games_by_week).items():
+            self._reconcile_week(week, candidate)
         self._reconcile("picker", parser.find_picker(articles), EVENT_PICKER)
-
-        # Picks: only look after the show window has closed, until end of Sunday.
         if show_end is None or now >= show_end or _is_sunday_ct(now):
             self._reconcile("picks", parser.find_picks(articles), EVENT_PICKS)
 
-        location = self._effective("location")
+        self._rollover()
+
+        location = self._effective_location(self.primary_week)
         picker = self._effective("picker")
         picks = self._effective("picks")
 
-        featured_game = _enrich_featured_game(location, events) if location else None
+        featured_game = None
+        if location and self.primary_week is not None:
+            featured_game = _enrich_featured_game(
+                location, events_by_week.get(self.primary_week, [])
+            )
         flair_team = _match_flair(location, featured_game, self.flair_teams)
 
-        # If the week rolled over and the stored location no longer maps to a
-        # scheduled game, expire it (prevents last week's site lingering).
-        if location and featured_game is None and not self._is_override("location"):
-            _LOGGER.debug("Stored location no longer maps to a game; expiring.")
-            self.state["location"] = None
-            location = None
-            flair_team = None
+        upcoming = self._build_upcoming(events_by_week)
 
         await self._async_save()
         self.update_interval = self._compute_interval(now, phase, next_show)
@@ -160,7 +203,7 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return {
             "phase": phase,
             "season_year": season_year,
-            "week_number": week_number,
+            "week_number": self.primary_week,
             "next_show": next_show,
             "show_end": show_end,
             "location": location,
@@ -168,17 +211,78 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "picks": picks,
             "featured_game": featured_game,
             "flair_team": flair_team,
+            "upcoming": upcoming,
             "fresh_until": self._fresh_until(),
         }
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Schedule helpers
     # ------------------------------------------------------------------
-    def _is_override(self, key: str) -> bool:
-        return key in self.state["overrides"]
+    def _reconcile_week(self, week: int, parsed: dict) -> None:
+        wk = str(week)
+        if f"location:{week}" in self.state["overrides"]:
+            return
+        current = self.state["schedule"].get(wk)
+        if current and current.get("school") == parsed.get("school"):
+            return
+        parsed["announced_at"] = dt_util.utcnow().isoformat()
+        parsed["method"] = "parsed"
+        parsed["week"] = week
+        self.state["schedule"][wk] = parsed
+        self.hass.bus.async_fire(EVENT_LOCATION, parsed)
+        _LOGGER.info("GameDay week %s site: %s", week, parsed.get("school"))
+
+    def _reconcile(self, key: str, parsed: dict | None, event: str) -> None:
+        if parsed is None:
+            return
+        current = self.state.get(key)
+        marker = parsed.get("name") or str(parsed.get("picks"))
+        current_marker = None
+        if current:
+            current_marker = current.get("name") or str(current.get("picks"))
+        if marker and marker != current_marker:
+            parsed["announced_at"] = dt_util.utcnow().isoformat()
+            parsed["method"] = "parsed"
+            self.state[key] = parsed
+            self.hass.bus.async_fire(event, parsed)
+            _LOGGER.info("GameDay %s update: %s", key, marker)
+
+    def _rollover(self) -> None:
+        """Drop past weeks; clear week-scoped state when the week advances."""
+        if self.primary_week is None:
+            return
+        last = self.state.get("last_primary")
+        if last is not None and last != self.primary_week:
+            # New show week: last week's picker/picks are stale.
+            self.state["picker"] = None
+            self.state["picks"] = None
+            self.state["overrides"].pop("picker", None)
+            self.state["overrides"].pop("picks", None)
+        self.state["last_primary"] = self.primary_week
+        self.state["schedule"] = {
+            wk: entry
+            for wk, entry in self.state["schedule"].items()
+            if int(wk) >= self.primary_week
+        }
+        self.state["overrides"] = {
+            key: val
+            for key, val in self.state["overrides"].items()
+            if not key.startswith("location:")
+            or int(key.split(":")[1]) >= self.primary_week
+        }
+
+    def _effective_location(self, week: int | None) -> dict | None:
+        if week is None:
+            return None
+        override = self.state["overrides"].get(f"location:{week}")
+        if override:
+            value = dict(override["value"])
+            value["method"] = "manual"
+            value["announced_at"] = override["set_at"]
+            return value
+        return self.state["schedule"].get(str(week))
 
     def _effective(self, key: str) -> dict | None:
-        """Override wins over parsed state."""
         override = self.state["overrides"].get(key)
         if override:
             value = override["value"]
@@ -188,29 +292,30 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return base
         return self.state.get(key)
 
-    def _reconcile(self, key: str, parsed: dict | None, event: str) -> None:
-        """Store newly parsed data and fire the announcement event on change."""
-        if parsed is None:
-            return
-        current = self.state.get(key)
-        marker = parsed.get("school") or parsed.get("name") or str(parsed.get("picks"))
-        current_marker = None
-        if current:
-            current_marker = (
-                current.get("school") or current.get("name") or str(current.get("picks"))
-            )
-        if marker and marker != current_marker:
-            parsed["announced_at"] = dt_util.utcnow().isoformat()
-            parsed["method"] = "parsed"
-            self.state[key] = parsed
-            self.hass.bus.async_fire(event, parsed)
-            _LOGGER.info("GameDay %s update: %s", key, marker)
+    def _build_upcoming(self, events_by_week: dict[int, list[dict]]) -> list[dict]:
+        if self.primary_week is None:
+            return []
+        weeks: set[int] = {int(wk) for wk in self.state["schedule"]}
+        for key in self.state["overrides"]:
+            if key.startswith("location:"):
+                weeks.add(int(key.split(":")[1]))
+        out: list[dict] = []
+        for wk in sorted(w for w in weeks if w > self.primary_week):
+            entry = self._effective_location(wk)
+            if not entry:
+                continue
+            item = {"week": wk, "school": entry.get("school")}
+            game = _enrich_featured_game(entry, events_by_week.get(wk, []))
+            if game:
+                item["matchup"] = game.get("matchup")
+                item["kickoff"] = game.get("kickoff")
+            out.append(item)
+        return out
 
     def _fresh_until(self) -> str | None:
-        """Latest announced_at + FRESH_WINDOW across location/picker."""
         stamps = []
-        for key in ("location", "picker"):
-            data = self._effective(key)
+        location = self._effective_location(self.primary_week)
+        for data in (location, self._effective("picker")):
             if data and data.get("announced_at"):
                 parsed = _parse_iso(data["announced_at"])
                 if parsed:
@@ -224,16 +329,14 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now: datetime, phase: str, next_show: datetime | None
     ) -> timedelta:
         if phase == PHASE_OFFSEASON:
-            # Tighten up in the 3 weeks before premiere so the first
-            # announcement isn't missed.
             if next_show and (next_show - now) <= timedelta(days=21):
                 return INTERVAL_IN_SEASON
             return INTERVAL_OFFSEASON
         local = now.astimezone(CT)
         weekday, hour = local.weekday(), local.hour
-        if weekday == 5 and 5 <= hour < 12:  # Saturday show morning
+        if weekday == 5 and 5 <= hour < 12:
             return INTERVAL_HOT
-        if (weekday == 5 and hour >= 18) or weekday == 6:  # announcement window
+        if (weekday == 5 and hour >= 18) or weekday == 6:
             return INTERVAL_HOT
         return INTERVAL_IN_SEASON
 
@@ -253,17 +356,49 @@ def _parse_iso(value: str | None) -> datetime | None:
     return parsed
 
 
-def _premiere_from_calendar(league: dict) -> datetime | None:
-    """Premiere Saturday derived from the regular-season Week 1 calendar entry.
+def _week_windows(league: dict) -> dict[int, tuple[datetime, datetime]]:
+    """{week_number: (start, end)} from the REGULAR season calendar block."""
+    out: dict[int, tuple[datetime, datetime]] = {}
+    for block in league.get("calendar") or []:
+        if not isinstance(block, dict):
+            return out
+        label = (block.get("label") or "").lower()
+        if "regular" not in label and str(block.get("value")) != "2":
+            continue
+        for entry in block.get("entries") or []:
+            num: int | None = None
+            try:
+                num = int(entry.get("value"))
+            except (TypeError, ValueError):
+                match = re.search(r"(\d+)", entry.get("label") or "")
+                num = int(match.group(1)) if match else None
+            start = _parse_iso(entry.get("startDate"))
+            end = _parse_iso(entry.get("endDate"))
+            if num is not None and start and end:
+                out[num] = (start, end)
+    return out
 
-    ESPN's calendar usually folds Week 0 into its 'Week 1' entry, so the
-    entry's date range spans two Saturdays. GameDay premieres on the LAST
-    Saturday of that range (the true Week 1 Saturday), so anchor there:
-    last Saturday on/before the entry's endDate, at 9:00 AM ET.
+
+def _week_of(
+    moment: datetime | None, windows: dict[int, tuple[datetime, datetime]]
+) -> int | None:
+    if not moment:
+        return None
+    for num, (start, end) in windows.items():
+        if start <= moment <= end:
+            return num
+    return None
+
+
+def _premiere_from_calendar(league: dict) -> datetime | None:
+    """Premiere Saturday derived from the regular-season Week 1 entry.
+
+    ESPN usually folds Week 0 into its 'Week 1' entry, so anchor to the
+    LAST Saturday on/before that entry's endDate, at 9:00 AM ET.
     """
     for block in league.get("calendar") or []:
         if not isinstance(block, dict):
-            return None  # unexpected calendar shape; fall back to old logic
+            return None
         label = (block.get("label") or "").lower()
         if "regular" not in label and str(block.get("value")) != "2":
             continue
@@ -274,7 +409,7 @@ def _premiere_from_calendar(league: dict) -> datetime | None:
         if not end:
             return None
         local = end.astimezone(ET)
-        days_back = (local.weekday() - 5) % 7  # Saturday == weekday 5
+        days_back = (local.weekday() - 5) % 7
         saturday = (local - timedelta(days=days_back)).replace(
             hour=SHOW_START_HOUR_ET, minute=0, second=0, microsecond=0
         )
@@ -288,11 +423,7 @@ def _next_show_window(
     season_end: datetime | None,
     premiere: datetime | None = None,
 ) -> tuple[datetime | None, datetime | None]:
-    """Next Saturday 9:00-12:00 ET that falls inside the season.
-
-    Before the premiere, the countdown targets the premiere itself rather
-    than the first Saturday of ESPN's season range (which includes Week 0).
-    """
+    """Next Saturday 9:00-12:00 ET inside the season (premiere-anchored)."""
     if not season_start or not season_end:
         return None, None
     if premiere and now < premiere:
@@ -318,8 +449,15 @@ def _is_sunday_ct(now: datetime) -> bool:
     return now.astimezone(CT).weekday() == 6
 
 
+def _hex(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip()
+    return value if value.startswith("#") else f"#{value}"
+
+
 def _enrich_featured_game(location: dict, events: list[dict]) -> dict | None:
-    """Pull matchup/kickoff/TV/odds for the game GameDay is at."""
+    """Matchup/kickoff/TV/odds + host-team colors for the located game."""
     target = None
     game_id = location.get("game_id")
     school = (location.get("school") or "").lower()
@@ -349,10 +487,14 @@ def _enrich_featured_game(location: dict, events: list[dict]) -> dict | None:
         comp = next((c for c in competitors if c.get("homeAway") == side), {})
         team = comp.get("team", {})
         rank = (comp.get("curatedRank") or {}).get("current")
+        logos = team.get("logos") or []
         return {
             "name": team.get("displayName"),
             "abbr": team.get("abbreviation"),
             "rank": rank if rank and rank != 99 else None,
+            "color": _hex(team.get("color")),
+            "alt_color": _hex(team.get("alternateColor")),
+            "logo": team.get("logo") or (logos[0].get("href") if logos else None),
         }
 
     home, away = _side("home"), _side("away")
@@ -385,7 +527,6 @@ def _enrich_featured_game(location: dict, events: list[dict]) -> dict | None:
 def _match_flair(
     location: dict | None, featured_game: dict | None, flair_teams: list[str]
 ) -> str | None:
-    """Return the matched flair team name (lowercase) if host site matches."""
     candidates: set[str] = set()
     if location and location.get("school"):
         candidates.add(location["school"].lower())

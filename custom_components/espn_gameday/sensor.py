@@ -26,6 +26,7 @@ async def async_setup_entry(
             GuestPickerSensor(coordinator),
             FeaturedGameSensor(coordinator),
             FinalPicksSensor(coordinator),
+            UpcomingSensor(coordinator),
         ]
     )
 
@@ -87,6 +88,7 @@ class LocationSensor(GameDayEntity, SensorEntity):
         location = self._data.get("location") or {}
         game = self._data.get("featured_game") or {}
         return {
+            "week": location.get("week"),
             "venue": game.get("venue"),
             "city": game.get("city"),
             "state": game.get("state"),
@@ -154,6 +156,22 @@ class FinalPicksSensor(GameDayEntity, SensorEntity):
             "method": picks.get("method"),
             "announced_at": picks.get("announced_at"),
         }
+
+
+class UpcomingSensor(GameDayEntity, SensorEntity):
+    _attr_icon = "mdi:calendar-arrow-right"
+
+    def __init__(self, coordinator: GameDayCoordinator) -> None:
+        super().__init__(coordinator, "upcoming", "GameDay Upcoming Sites")
+
+    @property
+    def native_value(self) -> str:
+        upcoming = self._data.get("upcoming") or []
+        return upcoming[0]["school"] if upcoming else "TBA"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"schedule": self._data.get("upcoming") or []}
 
 
 def _iso(value: datetime | None) -> str | None:

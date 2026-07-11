@@ -8,6 +8,14 @@ set_location:
       required: true
       selector:
         text:
+    week:
+      name: Week
+      description: Season week number. Omit for the current/premiere week.
+      selector:
+        number:
+          min: 1
+          max: 20
+          mode: box
     source_url:
       name: Source URL
       description: Optional link to the announcement.

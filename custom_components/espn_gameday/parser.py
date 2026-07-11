@@ -49,9 +49,15 @@ class GameAliases:
     """Searchable name aliases for one scheduled game."""
 
     game_id: str
+    home_name: str = ""
     home_aliases: set[str] = field(default_factory=set)
     venue_city: str = ""
     summary: dict[str, Any] = field(default_factory=dict)
+
+
+def _mentions(needle: str, haystack_low: str) -> bool:
+    """Word-boundary containment check (prevents 'lsu' inside other words)."""
+    return bool(re.search(rf"\b{re.escape(needle)}\b", haystack_low))
 
 
 def _article_text(article: dict) -> str:
@@ -83,19 +89,91 @@ def build_game_aliases(events: list[dict]) -> list[GameAliases]:
                 team.get("shortDisplayName"),
                 team.get("name"),
             )
-            if v and len(v) > 3
+            if v and len(v) >= 3
         }
         venue = comps.get("venue", {}) or {}
         city = (venue.get("address", {}) or {}).get("city", "") or ""
         out.append(
             GameAliases(
                 game_id=str(ev.get("id", "")),
+                home_name=team.get("location") or team.get("displayName") or "",
                 home_aliases=aliases,
                 venue_city=city,
                 summary=ev,
             )
         )
     return out
+
+
+EXPLICIT_WEEK = re.compile(r"\bweek\s+(\d{1,2})\b", re.IGNORECASE)
+
+
+def find_locations(
+    articles: list[dict], games_by_week: dict[int, list[GameAliases]]
+) -> dict[int, dict]:
+    """Return {week: candidate} for every announcement found.
+
+    Week attribution:
+    1. Explicit "Week N" in the article -> that week (confidence +1).
+    2. Otherwise -> earliest week in the fetch window where the announced
+       school hosts a home game; if it hosts in multiple fetched weeks
+       (rare), confidence -1.
+    """
+    results: dict[int, dict] = {}
+    for article in articles:
+        text = _article_text(article)
+        low = text.lower()
+        if "gameday" not in low:
+            continue
+        score = 0
+        if any(p.search(low) for p in DESTINATION_PATTERNS):
+            score += 2
+        if "gameday" in (article.get("headline") or "").lower():
+            score += 1
+        if score < 2:
+            continue
+
+        explicit = EXPLICIT_WEEK.search(text)
+        explicit_week = int(explicit.group(1)) if explicit else None
+
+        # Which weeks does this article's school map to?
+        hits: list[tuple[int, str, str, bool]] = []  # (week, school, game_id, both)
+        for week in sorted(games_by_week):
+            for game in games_by_week[week]:
+                alias_hit = any(_mentions(a, low) for a in game.home_aliases)
+                city_hit = bool(game.venue_city) and _mentions(
+                    game.venue_city.lower(), low
+                )
+                if alias_hit or city_hit:
+                    hits.append(
+                        (week, game.home_name or game.venue_city, game.game_id,
+                         alias_hit and city_hit)
+                    )
+        if not hits:
+            continue
+
+        if explicit_week is not None:
+            week_hits = [h for h in hits if h[0] == explicit_week]
+            if not week_hits:
+                continue  # explicit week doesn't match schedule: never guess
+            week, school, game_id, both = week_hits[0]
+            confidence = score + 1 + (1 if both else 0)
+        else:
+            week, school, game_id, both = hits[0]  # earliest week
+            confidence = score + (1 if both else 0)
+            if len({h[0] for h in hits if h[1] == school}) > 1:
+                confidence -= 1  # same school hosts in multiple fetched weeks
+
+        candidate = {
+            "school": school,
+            "game_id": game_id,
+            "source_url": _article_link(article),
+            "confidence": confidence,
+            "published": article.get("published", ""),
+        }
+        if week not in results or candidate["confidence"] > results[week]["confidence"]:
+            results[week] = candidate
+    return results
 
 
 def find_location(articles: list[dict], games: list[GameAliases]) -> dict | None:

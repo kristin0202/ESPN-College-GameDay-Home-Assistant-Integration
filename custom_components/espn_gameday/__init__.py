@@ -22,6 +22,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 SET_LOCATION_SCHEMA = vol.Schema(
     {
         vol.Required("school"): cv.string,
+        vol.Optional("week"): vol.Coerce(int),
         vol.Optional("source_url", default=""): cv.string,
     }
 )
@@ -66,9 +67,10 @@ def _register_services(hass: HomeAssistant) -> None:
         return
 
     async def set_location(call: ServiceCall) -> None:
-        await _coordinator(hass).async_set_override(
-            "location",
-            {"school": call.data["school"], "source_url": call.data["source_url"]},
+        await _coordinator(hass).async_set_location(
+            call.data["school"],
+            week=call.data.get("week"),
+            source_url=call.data["source_url"],
         )
 
     async def set_picker(call: ServiceCall) -> None:
