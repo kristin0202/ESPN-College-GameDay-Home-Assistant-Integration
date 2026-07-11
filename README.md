@@ -1,11 +1,11 @@
 # ESPN College GameDay — Home Assistant Integration
 
-Unofficial integration that tracks ESPN's College GameDay: season-premiere countdown, host-site announcements, featured-game details (ranks, kickoff, TV, betting line), guest picker, and end-of-show final picks. Pairs with [gameday-card](https://github.com/kristin0202/gameday-card).
+Unofficial integration that tracks ESPN's College GameDay: season-premiere countdown, host-site announcements, featured-game details (ranks, kickoff, TV, betting line), guest picker, and end-of-show final picks. Pairs with [`gameday-card`](../gameday-card).
 
 > ⚠️ Uses ESPN's **undocumented** site APIs. They can change without notice. When they do, sensors go `unavailable` (never wrong) — file an issue / patch `parser.py`.
 
-## Install (HACS)
-1. HACS → Integrations → ⋮ → **Custom repositories** → add this repo URL, category **Integration**.
+## Install (HACS 2.x)
+1. Sidebar → **HACS** → ⋮ (top-right, next to search) → **Custom repositories** → add this repo URL, type **Integration**.
 2. Install **ESPN College GameDay**, restart HA.
 3. Settings → Devices & Services → **Add Integration** → ESPN College GameDay.
 4. Flair teams default to `Washington, Michigan` — edit at setup if needed.
@@ -18,6 +18,7 @@ Unofficial integration that tracks ESPN's College GameDay: season-premiere count
 | `sensor.gameday_guest_picker` | name or `TBA` | `source_url`, `method` |
 | `sensor.gameday_featured_game` | matchup or `TBA` | `kickoff`, `tv`, `spread`, `over_under`, ranks |
 | `sensor.gameday_final_picks` | `available`/`unavailable` | `picks` (name→team), `source_url` |
+| `sensor.gameday_upcoming` | next future site or `TBA` | `schedule`: `[{week, school, matchup, kickoff}]` |
 | `binary_sensor.gameday_new_announcement` | on for ~30 min after a change | — |
 | `binary_sensor.gameday_flair_week` | on when a flair team hosts | `flair_team` |
 
@@ -42,8 +43,13 @@ automation:
 
 ## Override services (safety valve — parser misses happen)
 ```yaml
+# Current/premiere week:
 service: espn_gameday.set_location
-data: { school: "Washington" }
+data: { school: "LSU" }
+
+# A future week:
+service: espn_gameday.set_location
+data: { school: "Texas", week: 2 }
 
 service: espn_gameday.set_picker
 data: { name: "Macklemore" }
