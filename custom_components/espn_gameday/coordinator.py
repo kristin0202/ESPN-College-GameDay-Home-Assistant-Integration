@@ -318,7 +318,6 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stamps = []
         location = self._effective_location(self.primary_week)
         for data in (location, self._effective("picker")):
-            # Manual overrides aren't announcements — no fresh pulse.
             if data and data.get("method") == "manual":
                 continue
             if data and data.get("announced_at"):
