@@ -6,7 +6,7 @@ from typing import Any
 
 import aiohttp
 
-from .const import NEWS_LIMIT, NEWS_URL, SCOREBOARD_URL
+from .const import NEWS_LIMIT, NEWS_URL, RANKINGS_URL, SCOREBOARD_URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +41,17 @@ class EspnClient:
         if week is not None:
             params["week"] = week
         return await self._get(SCOREBOARD_URL, params)
+
+    async def get_rankings(self) -> list[dict]:
+        """Current polls (AP / Coaches / CFP), each with its top-25 ranks.
+
+        The scoreboard only carries a usable curatedRank for the week that is
+        actually in play — every future week reports 99 — so ranked matchups
+        for the lookahead weeks have to come from here.
+        """
+        data = await self._get(RANKINGS_URL)
+        rankings = data.get("rankings", [])
+        return rankings if isinstance(rankings, list) else []
 
     async def get_news(self) -> list[dict]:
         """Recent CFB news articles (headline, description, links, published)."""
