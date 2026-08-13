@@ -27,6 +27,10 @@ Manual overrides deliberately do **not** trigger `new_announcement` — you alre
 
 ## How the data is sourced
 
+**Official seeds.** Sites announced months ahead (the premiere is typically revealed in May) age out of ESPN's ~50-item news feed long before the season and can never be parsed. `official_schedule.py` seeds those weeks authoritatively — host school only; matchup, kickoff, TV, odds, ranks, and colors still come live from the scoreboard. Seeds never fire the announcement event (a May press release is not news in August), never overwrite an existing entry, and never apply to a week that has already aired. Precedence: **official seed < parsed announcement < manual override**. Update the file each spring; old seasons can stay.
+
+**Season rollover.** The persisted schedule is tagged with ESPN's season year. When the year changes, week-scoped state is cleared — without this, week numbers restarting at 1 would leave last season's entries looking current.
+
 **Schedule model.** Announced sites are stored per week. "Current location" is a derived view of the week containing the next show, so when a show week ends the next site is promoted automatically — no action needed.
 
 **Poll ranks.** ESPN's scoreboard only carries a usable `curatedRank` for the week actually in play; every future week reports `99`. Ranks for lookahead weeks therefore come from the rankings endpoint, preferring **AP Top 25 → Coaches Poll**, with a real `curatedRank` always winning when present. One poll is used outright rather than merging several, so a matchup billed "#3 at #1" has both numbers off the same ballot. Once CFP rankings begin, ESPN reuses the curated slot and those take over.
@@ -83,8 +87,14 @@ Per-week location overrides survive restarts and are dropped automatically once 
 ## Known limitations (accepted by design)
 - Guest picker automation ≈70%: sometimes only revealed on-air/social. Falls back to `TBA` + override.
 - Final picks ≈50% with 1–3 h post-show delay: depends on a recap article appearing in ESPN's news feed.
-- Announcement parsing requires the article to still be in ESPN's ~50-item news feed. Sites announced months in advance (e.g. a premiere site) will have aged out — set those with `set_location`.
+- Announcement parsing requires the article to still be in ESPN's ~50-item news feed. Sites announced months in advance are covered by `official_schedule.py` instead; anything it misses can be set with `set_location`.
 - Week attribution for an announcement without an explicit "Week N" uses the earliest week in the 3-week fetch window where that school hosts; ambiguity lowers `confidence` rather than guessing.
+
+## Tests
+```bash
+python3 tests/test_official_schedule.py
+```
+No Home Assistant install required — the suite extracts the pure functions and the seed method from source and exercises them against a stub, so every assertion runs rather than silently skipping.
 
 ## Repo conventions
 Edit files **either** in the GitHub web editor **or** by bulk upload — never both on the same file. Bulk "Add files via upload" silently overwrites web edits (this repo has lost the manifest URLs to that twice).
