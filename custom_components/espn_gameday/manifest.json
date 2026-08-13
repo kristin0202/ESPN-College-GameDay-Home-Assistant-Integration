@@ -11,5 +11,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/kristin0202/ESPN-College-GameDay-Home-Assistant-Integration/issues",
   "requirements": [],
-  "version": "0.5.0"
+  "version": "1.2.0"
 }
