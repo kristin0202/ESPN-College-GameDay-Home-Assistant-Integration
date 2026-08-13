@@ -6,6 +6,7 @@ containing the next show — so promotion on week rollover is automatic.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
@@ -34,6 +35,7 @@ from .const import (
     LOCAL_TZ,
     PHASE_IN_SEASON,
     PHASE_OFFSEASON,
+    POLL_PREFERENCE,
     SHOW_END_HOUR_ET,
     SHOW_START_HOUR_ET,
     SHOW_TZ,
@@ -166,6 +168,15 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except EspnApiError as err:
                     _LOGGER.debug("Week %s scoreboard fetch failed: %s", wk, err)
 
+        # --- Polls: the only rank source that covers the lookahead weeks ---
+        ranks: dict[str, int] = {}
+        try:
+            ranks = _build_rank_map(await self.client.get_rankings())
+        except (EspnApiError, asyncio.TimeoutError) as err:
+            # Ranks are decorative — a slow poll endpoint must not take the
+            # location/picker data down with it.
+            _LOGGER.warning("Rankings fetch failed (non-fatal): %s", err)
+
         # --- News parsing: always on; early announcements age out fast ---
         articles: list[dict] = []
         try:
@@ -191,11 +202,11 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         featured_game = None
         if location and self.primary_week is not None:
             featured_game = _enrich_featured_game(
-                location, events_by_week.get(self.primary_week, [])
+                location, events_by_week.get(self.primary_week, []), ranks
             )
         flair_team = _match_flair(location, featured_game, self.flair_teams)
 
-        upcoming = self._build_upcoming(events_by_week)
+        upcoming = self._build_upcoming(events_by_week, ranks)
 
         await self._async_save()
         self.update_interval = self._compute_interval(now, phase, next_show)
@@ -292,7 +303,9 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return base
         return self.state.get(key)
 
-    def _build_upcoming(self, events_by_week: dict[int, list[dict]]) -> list[dict]:
+    def _build_upcoming(
+        self, events_by_week: dict[int, list[dict]], ranks: dict[str, int]
+    ) -> list[dict]:
         if self.primary_week is None:
             return []
         weeks: set[int] = {int(wk) for wk in self.state["schedule"]}
@@ -305,7 +318,7 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not entry:
                 continue
             item = {"week": wk, "school": entry.get("school")}
-            game = _enrich_featured_game(entry, events_by_week.get(wk, []))
+            game = _enrich_featured_game(entry, events_by_week.get(wk, []), ranks)
             if game:
                 item["matchup"] = game.get("matchup")
                 item["kickoff"] = game.get("kickoff")
@@ -460,7 +473,34 @@ def _hex(value: str | None) -> str | None:
     return value if value.startswith("#") else f"#{value}"
 
 
-def _enrich_featured_game(location: dict, events: list[dict]) -> dict | None:
+def _build_rank_map(rankings: list[dict]) -> dict[str, int]:
+    """{team_id: rank} from the most preferred poll ESPN currently publishes.
+
+    One poll wins outright rather than merging several — a matchup billed as
+    "#3 vs #5" should have both numbers from the same ballot.
+    """
+    by_name: dict[str, dict] = {}
+    for poll in rankings:
+        name = (poll.get("name") or poll.get("shortName") or "").strip().lower()
+        if name:
+            by_name.setdefault(name, poll)
+    chosen = next((by_name[n] for n in POLL_PREFERENCE if n in by_name), None)
+    if chosen is None:
+        chosen = rankings[0] if rankings else None
+    if not chosen:
+        return {}
+    out: dict[str, int] = {}
+    for entry in chosen.get("ranks") or []:
+        team_id = str((entry.get("team") or {}).get("id") or "")
+        rank = entry.get("current")
+        if team_id and isinstance(rank, int) and 1 <= rank <= 25:
+            out[team_id] = rank
+    return out
+
+
+def _enrich_featured_game(
+    location: dict, events: list[dict], ranks: dict[str, int] | None = None
+) -> dict | None:
     """Matchup/kickoff/TV/odds + host-team colors for the located game."""
     target = None
     game_id = location.get("game_id")
@@ -490,12 +530,23 @@ def _enrich_featured_game(location: dict, events: list[dict]) -> dict | None:
     def _side(side: str) -> dict:
         comp = next((c for c in competitors if c.get("homeAway") == side), {})
         team = comp.get("team", {})
-        rank = (comp.get("curatedRank") or {}).get("current")
+        # curatedRank is 99 ("unranked") on every game outside the live week,
+        # so fall back to the poll map keyed by team id.
+        curated = (comp.get("curatedRank") or {}).get("current")
+        rank = curated if isinstance(curated, int) and 1 <= curated <= 25 else None
+        if rank is None:
+            rank = (ranks or {}).get(str(team.get("id") or ""))
         logos = team.get("logos") or []
         return {
             "name": team.get("displayName"),
+            # School without the mascot ("Ohio State", not "Ohio State Buckeyes").
+            "school": (
+                team.get("location")
+                or team.get("shortDisplayName")
+                or team.get("displayName")
+            ),
             "abbr": team.get("abbreviation"),
-            "rank": rank if rank and rank != 99 else None,
+            "rank": rank,
             "color": _hex(team.get("color")),
             "alt_color": _hex(team.get("alternateColor")),
             "logo": team.get("logo") or (logos[0].get("href") if logos else None),
@@ -512,7 +563,7 @@ def _enrich_featured_game(location: dict, events: list[dict]) -> dict | None:
 
     def _fmt(team: dict) -> str:
         prefix = f"#{team['rank']} " if team.get("rank") else ""
-        return f"{prefix}{team.get('name') or '?'}"
+        return f"{prefix}{team.get('school') or team.get('name') or '?'}"
 
     return {
         "matchup": f"{_fmt(away)} at {_fmt(home)}",
