@@ -11,7 +11,15 @@ SCOREBOARD_URL = (
 NEWS_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/football/college-football/news"
 )
+RANKINGS_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/football/college-football/rankings"
+)
 NEWS_LIMIT = 50
+
+# Poll preference when a game's own curatedRank is unset (every future week).
+# ESPN reuses the "curated" slot for the CFP rankings once those start, so a
+# real curatedRank always wins; these are the fallbacks, best first.
+POLL_PREFERENCE = ("ap top 25", "afca coaches poll", "coaches poll")
 
 # Show window: 9:00 AM - 12:00 PM Eastern, Saturdays during the season.
 SHOW_TZ = "America/New_York"
