@@ -43,6 +43,7 @@ from .const import (
     STORAGE_VERSION,
 )
 from . import parser
+from .official_schedule import get_official_schedule
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "picks": None,
             "overrides": {},
             "last_primary": None,
+            "season_year": None,
         }
         self.primary_week: int | None = None
         raw = entry.data.get(CONF_FLAIR_TEAMS, DEFAULT_FLAIR_TEAMS)
@@ -138,6 +140,7 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         season_start = _parse_iso(season.get("startDate"))
         season_end = _parse_iso(season.get("endDate"))
         season_year = season.get("year")
+        self._handle_season_change(season_year)
         base_week = (scoreboard.get("week") or {}).get("number")
 
         now = dt_util.utcnow()
@@ -187,6 +190,11 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         games_by_week = {
             wk: parser.build_game_aliases(evs) for wk, evs in events_by_week.items()
         }
+        # Authoritative seeds first: sites announced months ago have aged out
+        # of the news feed and can never be reparsed. Seeds never overwrite an
+        # existing entry, so the parser and overrides still win.
+        self._seed_official_schedule(season_year, events_by_week)
+
         for week, candidate in parser.find_locations(articles, games_by_week).items():
             self._reconcile_week(week, candidate)
         self._reconcile("picker", parser.find_picker(articles), EVENT_PICKER)
@@ -229,6 +237,66 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
     # Schedule helpers
     # ------------------------------------------------------------------
+    def _handle_season_change(self, season_year: Any) -> None:
+        """Wipe week-scoped state when ESPN rolls over to a new season.
+
+        Week numbers restart at 1 each season, so without this the rollover
+        filter (which keeps weeks >= primary_week) would preserve every stale
+        entry from the previous season instead of dropping it.
+        """
+        stored = self.state.get("season_year")
+        if stored is not None and season_year is not None and season_year != stored:
+            _LOGGER.info(
+                "GameDay season changed %s -> %s; clearing prior schedule",
+                stored,
+                season_year,
+            )
+            self.state["schedule"] = {}
+            self.state["overrides"] = {}
+            self.state["picker"] = None
+            self.state["picks"] = None
+            self.state["last_primary"] = None
+        if season_year is not None:
+            self.state["season_year"] = season_year
+
+    def _seed_official_schedule(
+        self, season_year: Any, events_by_week: dict[int, list[dict]]
+    ) -> None:
+        """Seed officially announced host sites that the parser cannot reach.
+
+        Deliberately does NOT fire EVENT_LOCATION: a seed is not news. Firing
+        it would notify on every fresh install for a months-old announcement,
+        and — because seeding runs before _rollover() — would re-fire on every
+        poll once the week had passed.
+        """
+        for week, official in get_official_schedule(season_year).items():
+            # Never resurrect a week that has already been shown. Without this
+            # the seed and _rollover() fight each other every cycle.
+            if self.primary_week is not None and week < self.primary_week:
+                continue
+            if f"location:{week}" in self.state["overrides"]:
+                continue
+            current = self.state["schedule"].get(str(week))
+            if current and current.get("school"):
+                continue
+            school = official.get("school")
+            if not school:
+                continue
+            published = official.get("published") or ""
+            self.state["schedule"][str(week)] = {
+                "school": school,
+                "game_id": _find_home_game_id(school, events_by_week.get(week, [])),
+                "source_url": official.get("source_url", ""),
+                "confidence": 100,
+                "method": "official",
+                "week": week,
+                "published": published,
+                # Real announcement date, so binary_sensor.gameday_new_announcement
+                # does not light up months later on a restart.
+                "announced_at": published,
+            }
+            _LOGGER.info("Seeded official GameDay week %s site: %s", week, school)
+
     def _reconcile_week(self, week: int, parsed: dict) -> None:
         wk = str(week)
         if f"location:{week}" in self.state["overrides"]:
@@ -577,6 +645,26 @@ def _enrich_featured_game(
         "city": (venue.get("address", {}) or {}).get("city"),
         "state": (venue.get("address", {}) or {}).get("state"),
     }
+
+
+def _find_home_game_id(school: str, events: list[dict]) -> str | None:
+    """ESPN game id for the game `school` hosts in this event list."""
+    target = school.strip().lower()
+    for event in events:
+        competition = (event.get("competitions") or [{}])[0]
+        for competitor in competition.get("competitors") or []:
+            if competitor.get("homeAway") != "home":
+                continue
+            team = competitor.get("team") or {}
+            names = {
+                str(team.get("location") or "").lower(),
+                str(team.get("displayName") or "").lower(),
+                str(team.get("shortDisplayName") or "").lower(),
+                str(team.get("abbreviation") or "").lower(),
+            }
+            if target in names:
+                return str(event.get("id") or "") or None
+    return None
 
 
 def _match_flair(
