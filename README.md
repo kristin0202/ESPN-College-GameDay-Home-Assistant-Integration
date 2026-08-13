@@ -1,6 +1,6 @@
 # ESPN College GameDay — Home Assistant Integration
 
-Unofficial integration that tracks ESPN's College GameDay: season-premiere countdown, host-site announcements, featured-game details (ranks, kickoff, TV, betting line), guest picker, and end-of-show final picks. Pairs with [`gameday-card`](../gameday-card).
+Unofficial integration that tracks ESPN's College GameDay: season-premiere countdown, host-site announcements, featured-game details (poll ranks, kickoff, TV, betting line), guest picker, end-of-show final picks, and a multi-week lookahead of announced sites. Pairs with [gameday-card](https://github.com/kristin0202/gameday-card).
 
 > ⚠️ Uses ESPN's **undocumented** site APIs. They can change without notice. When they do, sensors go `unavailable` (never wrong) — file an issue / patch `parser.py`.
 
@@ -11,19 +11,32 @@ Unofficial integration that tracks ESPN's College GameDay: season-premiere count
 4. Flair teams default to `Washington, Michigan` — edit at setup if needed.
 
 ## Entities
+
 | Entity | State | Key attributes |
 |---|---|---|
 | `sensor.gameday_next_show` | timestamp of next show (Sat 9am ET) | `phase`, `week_number`, `show_end`, `fresh_until` |
-| `sensor.gameday_location` | host school or `TBA` | `venue`, `city`, `state`, `source_url`, `confidence`, `method` |
+| `sensor.gameday_location` | host school or `TBA` | `week`, `venue`, `city`, `state`, `source_url`, `confidence`, `method` |
 | `sensor.gameday_guest_picker` | name or `TBA` | `source_url`, `method` |
-| `sensor.gameday_featured_game` | matchup or `TBA` | `kickoff`, `tv`, `spread`, `over_under`, ranks |
-| `sensor.gameday_final_picks` | `available`/`unavailable` | `picks` (name→team), `source_url` |
-| `sensor.gameday_upcoming` | next future site or `TBA` | `schedule`: `[{week, school, matchup, kickoff}]` |
-| `binary_sensor.gameday_new_announcement` | on for ~30 min after a change | — |
+| `sensor.gameday_featured_game` | matchup or `TBA` | `home`/`away` (incl. `school`, `rank`, `color`, `alt_color`, `logo`), `kickoff`, `tv`, `spread`, `over_under`, `venue`, `city`, `state` |
+| `sensor.gameday_final_picks` | `available`/`unavailable` | `picks` (name→team), `source_url`, `method` |
+| `sensor.gameday_upcoming` | next future site or `TBA` | `schedule`: `[{week, school, matchup, kickoff, city, state}]` |
+| `binary_sensor.gameday_new_announcement` | on ~30 min after a *parsed* announcement | — |
 | `binary_sensor.gameday_flair_week` | on when a flair team hosts | `flair_team` |
+
+Manual overrides deliberately do **not** trigger `new_announcement` — you already knew.
+
+## How the data is sourced
+
+**Schedule model.** Announced sites are stored per week. "Current location" is a derived view of the week containing the next show, so when a show week ends the next site is promoted automatically — no action needed.
+
+**Poll ranks.** ESPN's scoreboard only carries a usable `curatedRank` for the week actually in play; every future week reports `99`. Ranks for lookahead weeks therefore come from the rankings endpoint, preferring **AP Top 25 → Coaches Poll**, with a real `curatedRank` always winning when present. One poll is used outright rather than merging several, so a matchup billed "#3 at #1" has both numbers off the same ballot. Once CFP rankings begin, ESPN reuses the curated slot and those take over.
+
+**Polling.** 6 h offseason → 60 min in-season (and the final 3 pre-season weeks) → 10 min during the Sat-evening/Sunday announcement window and Saturday show mornings.
 
 ## Events
 `espn_gameday_location_announced` · `espn_gameday_picker_announced` · `espn_gameday_picks_available`
+
+The location event payload includes `week`, so automations can distinguish "this Saturday" from a lookahead announcement.
 
 ### Example: push notification on announcement
 ```yaml
@@ -33,10 +46,12 @@ automation:
       - platform: event
         event_type: espn_gameday_location_announced
     action:
-      - service: notify.mobile_app_YOUR_PHONE   # e.g. your Z Fold
+      - service: notify.mobile_app_YOUR_PHONE
         data:
           title: "🏈 College GameDay"
-          message: "GameDay is headed to {{ trigger.event.data.school }}!"
+          message: >
+            Week {{ trigger.event.data.week }}: GameDay is headed to
+            {{ trigger.event.data.school }}!
           data:
             url: "{{ trigger.event.data.source_url }}"
 ```
@@ -63,11 +78,13 @@ data:
 
 service: espn_gameday.clear_overrides
 ```
-
-## Polling behavior
-6 h offseason → 60 min in-season (and final 3 pre-season weeks) → 10 min during the Sat-evening/Sunday announcement window and Saturday show mornings.
+Per-week location overrides survive restarts and are dropped automatically once that week passes.
 
 ## Known limitations (accepted by design)
 - Guest picker automation ≈70%: sometimes only revealed on-air/social. Falls back to `TBA` + override.
 - Final picks ≈50% with 1–3 h post-show delay: depends on a recap article appearing in ESPN's news feed.
-- Week 0 shows: countdown anchors to ESPN's season calendar; the announcement parser catches a Week 0 site regardless.
+- Announcement parsing requires the article to still be in ESPN's ~50-item news feed. Sites announced months in advance (e.g. a premiere site) will have aged out — set those with `set_location`.
+- Week attribution for an announcement without an explicit "Week N" uses the earliest week in the 3-week fetch window where that school hosts; ambiguity lowers `confidence` rather than guessing.
+
+## Repo conventions
+Edit files **either** in the GitHub web editor **or** by bulk upload — never both on the same file. Bulk "Add files via upload" silently overwrites web edits (this repo has lost the manifest URLs to that twice).
