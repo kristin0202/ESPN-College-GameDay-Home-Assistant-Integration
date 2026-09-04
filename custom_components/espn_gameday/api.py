@@ -7,7 +7,14 @@ from typing import Any
 
 import aiohttp
 
-from .const import NEWS_LIMIT, NEWS_URL, RANKINGS_URL, SCOREBOARD_URL
+from .const import (
+    DEEZER_ARTIST_URL,
+    ESPN_SEARCH_URL,
+    NEWS_LIMIT,
+    NEWS_URL,
+    RANKINGS_URL,
+    SCOREBOARD_URL,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -98,6 +105,14 @@ class EspnClient:
                 continue
             if result:
                 article["story"] = result
+
+    async def search_person(self, name: str) -> dict:
+        """ESPN site search -- carries a real headshot for athletes/coaches."""
+        return await self._get(ESPN_SEARCH_URL, {"query": name, "limit": 5})
+
+    async def search_artist(self, name: str) -> dict:
+        """Deezer artist search -- square press photos for musicians."""
+        return await self._get(DEEZER_ARTIST_URL, {"q": name, "limit": 3})
 
     async def get_news(self) -> list[dict]:
         """Recent CFB news articles (headline, description, links, published)."""

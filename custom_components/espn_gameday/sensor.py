@@ -117,6 +117,9 @@ class GuestPickerSensor(GameDayEntity, SensorEntity):
             "announced_at": picker.get("announced_at"),
             "source_url": picker.get("source_url"),
             "method": picker.get("method"),
+            # Real headshot (ESPN/Deezer) when one was found; the card falls
+            # back to its own Wikipedia lookup when this is None.
+            "image": picker.get("image"),
         }
 
 
