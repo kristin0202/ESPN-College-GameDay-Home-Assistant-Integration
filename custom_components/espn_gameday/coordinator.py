@@ -33,6 +33,7 @@ from .const import (
     INTERVAL_IN_SEASON,
     INTERVAL_OFFSEASON,
     LOCAL_TZ,
+    MAX_BODY_FETCHES,
     PHASE_IN_SEASON,
     PHASE_OFFSEASON,
     POLL_PREFERENCE,
@@ -42,7 +43,7 @@ from .const import (
     STORAGE_KEY,
     STORAGE_VERSION,
 )
-from . import parser
+from . import headshot, parser
 from .official_schedule import get_official_schedule
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,6 +73,9 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "schedule": {},
             "picker": None,
             "picks": None,
+            # {name, url} -- cached so a picker with no headshot is not
+            # re-queried on every poll. url may legitimately be None.
+            "picker_image": None,
             "overrides": {},
             "last_primary": None,
             "season_year": None,
@@ -187,6 +191,17 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except EspnApiError as err:
             _LOGGER.warning("News fetch failed (non-fatal): %s", err)
 
+        # The feed carries only headline + description, and ESPN buries the
+        # guest picker's name in the story body ("... was announced as the
+        # celebrity guest picker"). Pull bodies for the few GameDay-ish
+        # headlines so find_picker has something to match against.
+        bodies = [a for a in articles if parser.wants_body(a)][:MAX_BODY_FETCHES]
+        if bodies:
+            try:
+                await self.client.attach_stories(bodies)
+            except EspnApiError as err:
+                _LOGGER.debug("Story fetch failed (non-fatal): %s", err)
+
         games_by_week = {
             wk: parser.build_game_aliases(evs) for wk, evs in events_by_week.items()
         }
@@ -206,6 +221,9 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         location = self._effective_location(self.primary_week)
         picker = self._effective("picker")
         picks = self._effective("picks")
+
+        if picker and picker.get("name"):
+            picker = {**picker, "image": await self._async_picker_image(picker["name"])}
 
         featured_game = None
         if location and self.primary_week is not None:
@@ -394,6 +412,30 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 item["state"] = game.get("state")
             out.append(item)
         return out
+
+    async def _async_picker_image(self, name: str) -> str | None:
+        """Headshot URL for the picker, or None to leave the card's fallback.
+
+        Cached by name -- including a None result -- so a picker that neither
+        source knows costs two requests once, not two per poll.
+        """
+        cached = self.state.get("picker_image") or {}
+        if cached.get("name") == name:
+            return cached.get("url")
+
+        payloads: dict[str, Any] = {"espn": None, "deezer": None}
+        for key, call in (("espn", self.client.search_person),
+                          ("deezer", self.client.search_artist)):
+            try:
+                payloads[key] = await call(name)
+            except (EspnApiError, asyncio.TimeoutError) as err:
+                # A portrait is decorative; never fail the poll over one.
+                _LOGGER.debug("%s headshot lookup failed for %s: %s", key, name, err)
+
+        url = headshot.choose(name, espn=payloads["espn"], deezer=payloads["deezer"])
+        self.state["picker_image"] = {"name": name, "url": url}
+        _LOGGER.debug("Headshot for %s: %s", name, url or "none found")
+        return url
 
     def _fresh_until(self) -> str | None:
         stamps = []
