@@ -14,7 +14,12 @@ NEWS_URL = (
 RANKINGS_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/football/college-football/rankings"
 )
+# ESPN caps the news feed at 50 items server-side and ignores `offset`, so
+# this cannot be raised to see further back — verified against the live API.
 NEWS_LIMIT = 50
+# Story bodies cost one request each. Only GameDay/picker headlines qualify
+# (parser.wants_body), and this bounds a pathological feed.
+MAX_BODY_FETCHES = 4
 
 # Poll preference when a game's own curatedRank is unset (every future week).
 # ESPN reuses the "curated" slot for the CFP rankings once those start, so a

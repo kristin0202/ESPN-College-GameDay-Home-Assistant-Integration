@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from html import unescape
 from typing import Any
 
 # Phrases that indicate a destination announcement. Score +2.
@@ -25,14 +26,42 @@ DESTINATION_PATTERNS = [
     )
 ]
 
+# --- Guest-picker phrasing ---------------------------------------------
+#
+# The name capture stays case-SENSITIVE (it anchors on capitalised words), so
+# the literal phrases carry scoped (?i:...) flags instead of a global
+# re.IGNORECASE, which would let the name group swallow lowercase prose.
+# A name token is either initials ("A.J.") or a plain capitalised word. Words
+# deliberately exclude "." so the group cannot bleed across a sentence
+# boundary ("...Baton Rouge. Lainey Wilson" must not capture "Rouge. Lainey").
+_INITIALS = r"(?:[A-Z]\.){1,3}"
+_WORD = r"[A-Z][\w'\-]+"
+_TOKEN = rf"(?:{_INITIALS}|{_WORD})"
+_NAME = rf"{_TOKEN}(?:\s+{_TOKEN}){{1,2}}"
+# Optional appositive between the name and its verb: ", a Louisiana native,".
+_APPOS = r"(?:,\s[^,]{1,60},)?"
+# Optional auxiliary: ESPN writes "was announced", not "announced".
+_AUX = r"(?:\s+(?:was|is|are|were|has\s+been|have\s+been|had\s+been|will\s+be|would\s+be|to\s+be))?"
+_ACT = (
+    r"(?:named|announced|revealed|tabbed|set|selected|tapped|picked"
+    r"|serves?|serving|joins?|joining|will\s+serve|will\s+join)"
+)
+_PICKER = r"(?i:(?:celebrity\s+|special\s+|honorary\s+)?guest\s+picker)"
+
 PICKER_PATTERNS = [
     re.compile(p)
     for p in (
-        r"([A-Z][\w.'\-]+(?:\s+[A-Z][\w.'\-]+){1,2})\s+(?:will\s+(?:be|serve|join)|named|announced|revealed|tabbed|set)\s+(?:as\s+)?(?:the\s+)?(?:celebrity\s+)?guest\s+picker",
-        r"guest\s+picker\s*(?:is|will\s+be|:)\s*([A-Z][\w.'\-]+(?:\s+[A-Z][\w.'\-]+){1,2})",
-        r"([A-Z][\w.'\-]+(?:\s+[A-Z][\w.'\-]+){1,2})\s+(?:to\s+)?(?:serves?|joins?)\s+as\s+(?:the\s+)?guest\s+picker",
+        # "Lainey Wilson, a Louisiana native, was announced as the celebrity guest picker"
+        rf"({_NAME}){_APPOS}{_AUX}\s+{_ACT}\s+(?:as\s+)?(?:the\s+)?{_PICKER}",
+        # "Lainey Wilson is the guest picker" (auxiliary alone, no action verb)
+        rf"({_NAME}){_APPOS}\s+(?:is|was|will\s+be)\s+(?:the\s+)?{_PICKER}",
+        # "Guest picker: Lainey Wilson" / "the guest picker is Lainey Wilson"
+        rf"{_PICKER}\s*(?:is|will\s+be|:)\s*({_NAME})",
     )
 ]
+
+# Trailing sentence punctuation swept up by the name group.
+_NAME_TRAILING = re.compile(r"[\s.,;:!?]+$")
 
 PICKS_HEADLINE = re.compile(r"gameday.*\bpicks\b|\bpicks\b.*gameday", re.IGNORECASE)
 # "Name: Team" or "Name picks Team" pairs inside recap text.
@@ -60,8 +89,43 @@ def _mentions(needle: str, haystack_low: str) -> bool:
     return bool(re.search(rf"\b{re.escape(needle)}\b", haystack_low))
 
 
+_TAG = re.compile(r"<[^>]+>")
+_WS = re.compile(r"\s+")
+# A tag boundary before punctuation ("announced</a>.") leaves a floating space.
+_SPACE_BEFORE_PUNCT = re.compile(r"\s+([.,;:!?])")
+
+
+def strip_html(html: str) -> str:
+    """Flatten an ESPN story body to plain text.
+
+    Tags collapse to a single space so adjacent blocks (``</h2><p>``) do not
+    weld their words together, which would break the phrase patterns.
+    """
+    if not html:
+        return ""
+    flat = _WS.sub(" ", unescape(_TAG.sub(" ", html)))
+    return _SPACE_BEFORE_PUNCT.sub(r"\1", flat).strip()
+
+
+def wants_body(article: dict) -> bool:
+    """True when this article is worth spending a body fetch on.
+
+    The feed summary carries only headline + description; ESPN buries the
+    picker's name in the story. Fetching every article each poll would be
+    ~50 extra requests an hour, so only GameDay/picker headlines qualify,
+    and only while the body has not already been attached.
+    """
+    if article.get("story"):
+        return False
+    headline = (article.get("headline") or "").lower()
+    return "gameday" in headline or "picker" in headline
+
+
 def _article_text(article: dict) -> str:
-    return f"{article.get('headline', '')}. {article.get('description', '')}"
+    """Headline + description + (when attached) the full story body."""
+    base = f"{article.get('headline', '')}. {article.get('description', '')}"
+    story = strip_html(article.get("story") or "")
+    return f"{base} {story}".strip() if story else base
 
 
 def _article_link(article: dict) -> str:
@@ -221,7 +285,7 @@ def find_picker(articles: list[dict]) -> dict | None:
         for pattern in PICKER_PATTERNS:
             match = pattern.search(text)
             if match:
-                name = match.group(1).strip()
+                name = _NAME_TRAILING.sub("", match.group(1).strip())
                 # Reject obvious false captures.
                 if name.lower() in {"college gameday", "espn", "the show"}:
                     continue

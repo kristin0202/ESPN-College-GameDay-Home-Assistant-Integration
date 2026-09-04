@@ -6,8 +6,8 @@ the seed method from source and run them against a stub coordinator. That
 keeps every assertion live — an earlier version of this file silently skipped
 when the import failed, which is worse than having no test at all.
 
-Run from the repo root:
-    python3 tests/test_official_schedule.py
+Run:
+    python3 custom_components/espn_gameday/test_official_schedule.py
 """
 import importlib.util
 import re
@@ -15,7 +15,7 @@ import sys
 import textwrap
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1] / "custom_components" / "espn_gameday"
+ROOT = Path(__file__).resolve().parent
 COORDINATOR_SRC = (ROOT / "coordinator.py").read_text()
 
 

@@ -33,6 +33,7 @@ from .const import (
     INTERVAL_IN_SEASON,
     INTERVAL_OFFSEASON,
     LOCAL_TZ,
+    MAX_BODY_FETCHES,
     PHASE_IN_SEASON,
     PHASE_OFFSEASON,
     POLL_PREFERENCE,
@@ -186,6 +187,17 @@ class GameDayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             articles = await self.client.get_news()
         except EspnApiError as err:
             _LOGGER.warning("News fetch failed (non-fatal): %s", err)
+
+        # The feed carries only headline + description, and ESPN buries the
+        # guest picker's name in the story body ("... was announced as the
+        # celebrity guest picker"). Pull bodies for the few GameDay-ish
+        # headlines so find_picker has something to match against.
+        bodies = [a for a in articles if parser.wants_body(a)][:MAX_BODY_FETCHES]
+        if bodies:
+            try:
+                await self.client.attach_stories(bodies)
+            except EspnApiError as err:
+                _LOGGER.debug("Story fetch failed (non-fatal): %s", err)
 
         games_by_week = {
             wk: parser.build_game_aliases(evs) for wk, evs in events_by_week.items()
