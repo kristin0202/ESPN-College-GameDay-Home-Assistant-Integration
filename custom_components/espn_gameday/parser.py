@@ -14,17 +14,61 @@ from dataclasses import dataclass, field
 from html import unescape
 from typing import Any
 
-# Phrases that indicate a destination announcement. Score +2.
+# Phrases that indicate a destination announcement. Score +2. Matched against
+# _normalize()d text. Each match also anchors the sentence that names the site.
+# "College GameDay locations" is deliberately absent: on ESPN's schedule page
+# it heads the list of PAST sites ("Week 2: Austin"), which is not an
+# announcement.
 DESTINATION_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"gameday\s+(?:is\s+)?(?:head(?:ed|ing)|going|comes?|coming|travel(?:s|ing)?|returns?)\s+(?:back\s+)?to\b",
-        r"gameday\s+(?:will\s+be\s+)?(?:live\s+)?(?:at|in|from)\b",
+        r"gameday\s+(?:is\s+)?(?:heads?|head(?:ed|ing)|going|comes?|coming|travel(?:s|ing)?|returns?)\s+(?:back\s+)?to\b",
+        # A verb is required: bare 'joined "College GameDay" in 1996' is history.
+        r"gameday\s+(?:(?:will\s+be|is)\s+(?:live\s+)?|live\s+)(?:at|in|from)\b",
         r"(?:hosts?|hosting|welcomes?)\s+(?:espn'?s\s+)?college\s+gameday",
         r"gameday\s+(?:is\s+)?(?:set|slated|scheduled|bound)\s+for\b",
-        r"college\s+gameday\s+(?:location|site|destination)",
+        r"gameday\s+(?:visits?|is\s+visiting)\b",
     )
 ]
+
+# ESPN quotes the show name and usually appends the sponsor, and both land
+# between "gameday" and the verb:
+#   '"College GameDay Built by The Home Depot" will be in Austin'
+#   '"College GameDay" heads to Austin for Week 2.'
+_SHOW_QUOTES = re.compile(r"[\"“”]")
+_SPONSOR = re.compile(r"\bgameday\s+built\s+by\s+the\s+home\s+depot\b")
+# End of the announcement sentence. "LSU vs. Ole Miss", "St. Louis" and
+# initials are not sentence ends.
+_SENTENCE_END = re.compile(r"(?<!\bvs)(?<!\bst)(?<!\b[a-z])[.!?](?:\s|$)")
+_ANNOUNCEMENT_MAX = 200
+
+
+def _normalize(low: str) -> str:
+    """Lowercased article text with the show-name quoting and sponsor removed."""
+    return _SPONSOR.sub("gameday", _SHOW_QUOTES.sub("", low))
+
+
+def has_destination(low: str) -> bool:
+    """True if lowercased text contains a destination announcement."""
+    norm = _normalize(low)
+    return any(p.search(norm) for p in DESTINATION_PATTERNS)
+
+
+def _announcements(low: str) -> list[str]:
+    """Each sentence that announces a site, from its destination phrase on.
+
+    Schools are only credited when named here. Whole-article matching let
+    incidental mentions win: "Ohio State at Texas" put the show at Ohio,
+    and the schedule page's "Week 2: Austin" recap counted for Texas.
+    """
+    norm = _normalize(low)
+    out: list[str] = []
+    for pattern in DESTINATION_PATTERNS:
+        for match in pattern.finditer(norm):
+            window = norm[match.start():match.start() + _ANNOUNCEMENT_MAX]
+            end = _SENTENCE_END.search(window, match.end() - match.start())
+            out.append(window[:end.start()] if end else window)
+    return out
 
 # --- Guest-picker phrasing ---------------------------------------------
 #
@@ -182,6 +226,11 @@ def find_locations(
 ) -> dict[int, dict]:
     """Return {week: candidate} for every announcement found.
 
+    Only schools named in an announcement sentence count (_announcements).
+    A game named by both home team and venue city outranks one named by
+    either alone; if two games tie for strongest in the chosen week, the
+    article is skipped rather than guessed.
+
     Week attribution:
     1. Explicit "Week N" in the article -> that week (confidence +1).
     2. Otherwise -> earliest week in the fetch window where the announced
@@ -194,8 +243,9 @@ def find_locations(
         low = text.lower()
         if "gameday" not in low:
             continue
+        announcements = _announcements(low)
         score = 0
-        if any(p.search(low) for p in DESTINATION_PATTERNS):
+        if announcements:
             score += 2
         if "gameday" in (article.get("headline") or "").lower():
             score += 1
@@ -205,32 +255,39 @@ def find_locations(
         explicit = EXPLICIT_WEEK.search(text)
         explicit_week = int(explicit.group(1)) if explicit else None
 
-        # Which weeks does this article's school map to?
-        hits: list[tuple[int, str, str, bool]] = []  # (week, school, game_id, both)
+        # Which scheduled home games do the announcements name, and how firmly?
+        hits: list[tuple[int, str, str, int]] = []  # (week, school, game_id, strength)
         for week in sorted(games_by_week):
             for game in games_by_week[week]:
-                alias_hit = any(_mentions(a, low) for a in game.home_aliases)
-                city_hit = bool(game.venue_city) and _mentions(
-                    game.venue_city.lower(), low
+                alias_hit = any(
+                    _mentions(a, s) for a in game.home_aliases for s in announcements
+                )
+                city_hit = bool(game.venue_city) and any(
+                    _mentions(game.venue_city.lower(), s) for s in announcements
                 )
                 if alias_hit or city_hit:
                     hits.append(
                         (week, game.home_name or game.venue_city, game.game_id,
-                         alias_hit and city_hit)
+                         int(alias_hit) + int(city_hit))
                     )
-        if not hits:
-            continue
-
         if explicit_week is not None:
-            week_hits = [h for h in hits if h[0] == explicit_week]
-            if not week_hits:
-                continue  # explicit week doesn't match schedule: never guess
-            week, school, game_id, both = week_hits[0]
+            hits = [h for h in hits if h[0] == explicit_week]
+        if not hits:
+            continue  # nothing on the schedule (for that week): never guess
+
+        strongest = max(h[3] for h in hits)
+        top = [h for h in hits if h[3] == strongest]
+        week = min(h[0] for h in top)  # earliest week, if not explicit
+        in_week = [h for h in top if h[0] == week]
+        if len({h[2] for h in in_week}) > 1:
+            continue  # two sites equally plausible: never guess
+        week, school, game_id, strength = in_week[0]
+        both = strength == 2
+        if explicit_week is not None:
             confidence = score + 1 + (1 if both else 0)
         else:
-            week, school, game_id, both = hits[0]  # earliest week
             confidence = score + (1 if both else 0)
-            if len({h[0] for h in hits if h[1] == school}) > 1:
+            if len({h[0] for h in top if h[1] == school}) > 1:
                 confidence -= 1  # same school hosts in multiple fetched weeks
 
         candidate = {
