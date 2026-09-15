@@ -38,8 +38,9 @@ _INITIALS = r"(?:[A-Z]\.){1,3}"
 _WORD = r"[A-Z][\w'\-]+"
 _TOKEN = rf"(?:{_INITIALS}|{_WORD})"
 _NAME = rf"{_TOKEN}(?:\s+{_TOKEN}){{1,2}}"
-# Optional appositive between the name and its verb: ", a Louisiana native,".
-_APPOS = r"(?:,\s[^,]{1,60},)?"
+# A lone "," is the closing half of one that came BEFORE the name:
+# 'The Running Man" actor and Austin native, Glen Powell, was announced'.
+_APPOS = r"(?:,\s[^,]{1,60},|,)?"
 # Optional auxiliary: ESPN writes "was announced", not "announced".
 _AUX = r"(?:\s+(?:was|is|are|were|has\s+been|have\s+been|had\s+been|will\s+be|would\s+be|to\s+be))?"
 _ACT = (
@@ -51,6 +52,10 @@ _PICKER = r"(?i:(?:celebrity\s+|special\s+|honorary\s+)?guest\s+picker)"
 PICKER_PATTERNS = [
     re.compile(p)
     for p in (
+        # "Aaron Donald will return to his alma mater Pitt to serve as guest
+        # picker" -- a clause between name and verb, held to one sentence.
+        rf"({_NAME}){_APPOS}\s+(?:will|is|was)\s+[^.!?]{{0,80}}?\bto\s+(?:serve|be)"
+        rf"\s+(?:as\s+)?(?:the\s+)?(?:this\s+week(?:end)?'s\s+)?{_PICKER}",
         # "Lainey Wilson, a Louisiana native, was announced as the celebrity guest picker"
         rf"({_NAME}){_APPOS}{_AUX}\s+{_ACT}\s+(?:as\s+)?(?:the\s+)?{_PICKER}",
         # "Lainey Wilson is the guest picker" (auxiliary alone, no action verb)
